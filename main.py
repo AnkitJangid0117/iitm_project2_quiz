@@ -22,8 +22,8 @@ import os
 app = FastAPI()
 
 # Configuration
-MY_SECRET = os.getenv("QUIZ_SECRET", "my_secret")
-MY_EMAIL = os.getenv("QUIZ_EMAIL", "23f1001630@ds.study.iitm.ac.in")
+MY_SECRET = os.getenv("QUIZ_SECRET", "")
+MY_EMAIL = os.getenv("QUIZ_EMAIL", "")
 AIPIPE_TOKEN = os.getenv("AIPIPE_TOKEN", "")
 AIPIPE_URL = os.getenv("AIPIPE_URL", "")
 
