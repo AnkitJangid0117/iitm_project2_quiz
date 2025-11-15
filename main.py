@@ -1,5 +1,14 @@
-# main.py - Simple HTTP version without browser automation
-from fastapi import FastAPI, HTTPException
+# ==========================================
+# FILE: main.py
+# ==========================================
+# main.py - Enhanced with AIPIPE AI and Base64 Decoding
+from dotenv import load_dotenv
+import os
+
+# Load .env file (works locally, ignored on Railway)
+load_dotenv()
+
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 import requests
@@ -12,8 +21,9 @@ import time
 from typing import Optional, Dict, Any
 import asyncio
 from concurrent.futures import ThreadPoolExecutor
-import os
 from bs4 import BeautifulSoup
+import base64
+from urllib.parse import urljoin
 
 app = FastAPI()
 
@@ -175,6 +185,16 @@ def fallback_analysis(question: str, data: Any) -> Any:
             numeric_cols = data.select_dtypes(include=['number']).columns
             if len(numeric_cols) > 0:
                 return float(data[numeric_cols[0]].mean())
+        
+        if 'max' in question_lower or 'highest' in question_lower:
+            numeric_cols = data.select_dtypes(include=['number']).columns
+            if len(numeric_cols) > 0:
+                return int(data[numeric_cols[0]].max())
+        
+        if 'min' in question_lower or 'lowest' in question_lower:
+            numeric_cols = data.select_dtypes(include=['number']).columns
+            if len(numeric_cols) > 0:
+                return int(data[numeric_cols[0]].min())
     
     if isinstance(data, (str, dict)):
         data_str = str(data)
@@ -230,26 +250,75 @@ def solve_quiz(quiz_url: str) -> Dict[str, Any]:
     
     # Parse HTML
     soup = BeautifulSoup(response.text, 'html.parser')
-    page_text = soup.get_text()
+    
+    # Check for base64 encoded content in JavaScript
+    page_text = None
+    
+    # Look for atob() JavaScript pattern (base64 decoding)
+    script_tags = soup.find_all('script')
+    for script in script_tags:
+        script_content = script.string
+        if script_content and 'atob' in script_content:
+            # Extract base64 content from atob(`...`)
+            match = re.search(r'atob\([`\'"]([^`\'"]+)[`\'"]', script_content)
+            if match:
+                try:
+                    base64_content = match.group(1)
+                    decoded = base64.b64decode(base64_content).decode('utf-8')
+                    page_text = decoded
+                    print("✓ Decoded base64 JavaScript content")
+                    break
+                except Exception as e:
+                    print(f"Failed to decode base64: {e}")
+    
+    # Fallback to regular text extraction
+    if not page_text:
+        page_text = soup.get_text()
+        print("Using plain text content")
     
     print(f"Page content (first 500 chars): {page_text[:500]}")
     
-    # Extract submit URL
-    submit_url_match = re.search(r'https?://[^\s]+/submit', page_text)
-    if not submit_url_match:
-        raise Exception("Could not find submit URL in page")
+    # Extract submit URL - handle both absolute and relative URLs
+    submit_url = None
     
-    submit_url = submit_url_match.group(0)
+    # Try to find full URL first
+    submit_url_match = re.search(r'https?://[^\s]+/submit', page_text)
+    if submit_url_match:
+        submit_url = submit_url_match.group(0)
+    else:
+        # Look for relative URL pattern like "to /submit" or "POST to /submit"
+        relative_match = re.search(r'to\s+(/[^\s]+/submit)', page_text)
+        if relative_match:
+            relative_path = relative_match.group(1)
+            submit_url = urljoin(quiz_url, relative_path)
+        else:
+            # Try just looking for "/submit"
+            if '/submit' in page_text:
+                submit_url = urljoin(quiz_url, '/submit')
+            else:
+                raise Exception("Could not find submit URL in page")
+    
     print(f"Submit URL: {submit_url}")
     
     # Find file links
     file_url = None
-    for link in soup.find_all('a', href=True):
+    links = soup.find_all('a', href=True)
+    for link in links:
         href = link['href']
         text = link.get_text().lower()
         if re.search(r'\.(pdf|csv|xlsx?|json|txt)$', href, re.I) or 'file' in text or 'download' in text:
-            file_url = href
+            # Handle relative file URLs
+            if not href.startswith('http'):
+                file_url = urljoin(quiz_url, href)
+            else:
+                file_url = href
             break
+    
+    # Also check in decoded page_text for file URLs
+    if not file_url:
+        file_match = re.search(r'href=["\']([^"\']+\.(pdf|csv|xlsx?|json|txt))["\']', page_text, re.I)
+        if file_match:
+            file_url = urljoin(quiz_url, file_match.group(1))
     
     # Solve the question
     answer = None
@@ -362,7 +431,7 @@ async def handle_quiz(request: QuizRequest):
 @app.get("/")
 async def root():
     return {
-        "message": "Quiz API Endpoint (HTTP Version)", 
+        "message": "Quiz API Endpoint with AI (Base64 Decoding Support)", 
         "status": "running",
         "ai_enabled": bool(AIPIPE_TOKEN)
     }
@@ -377,4 +446,7 @@ async def health():
 if __name__ == "__main__":
     import uvicorn
     port = int(os.getenv("PORT", 8000))
+    print(f"Starting server on port {port}")
     uvicorn.run(app, host="0.0.0.0", port=port)
+
+
