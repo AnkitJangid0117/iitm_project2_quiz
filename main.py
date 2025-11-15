@@ -24,8 +24,8 @@ app = FastAPI()
 # Configuration
 MY_SECRET = os.getenv("QUIZ_SECRET", "my_secret")
 MY_EMAIL = os.getenv("QUIZ_EMAIL", "23f1001630@ds.study.iitm.ac.in")
-AIPIPE_TOKEN = os.getenv("AIPIPE_TOKEN", "eyJhbGciOiJIUzI1NiJ9.eyJlbWFpbCI6IjIzZjEwMDE2MzBAZHMuc3R1ZHkuaWl0bS5hYy5pbiJ9.Lb3IoP9X54cAs1BaoBlzqx4l0C47XdjHdeNmlGOqc34")
-AIPIPE_URL = os.getenv("AIPIPE_URL", "https://aipipe.org/openai/v1/responses")
+AIPIPE_TOKEN = os.getenv("AIPIPE_TOKEN", "")
+AIPIPE_URL = os.getenv("AIPIPE_URL", "")
 
 # Thread pool for running sync browser operations
 executor = ThreadPoolExecutor(max_workers=3)
