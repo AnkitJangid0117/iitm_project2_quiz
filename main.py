@@ -1,0 +1,420 @@
+# main.py - Enhanced with AIPIPE AI
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import JSONResponse
+from pydantic import BaseModel
+from selenium import webdriver
+from selenium.webdriver.chrome.options import Options
+from selenium.webdriver.common.by import By
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
+import requests
+import pandas as pd
+import PyPDF2
+import io
+import json
+import re
+import time
+from typing import Optional, Dict, Any
+import asyncio
+from concurrent.futures import ThreadPoolExecutor
+import os
+
+app = FastAPI()
+
+# Configuration
+MY_SECRET = os.getenv("QUIZ_SECRET", "my_secret")
+MY_EMAIL = os.getenv("QUIZ_EMAIL", "23f1001630@ds.study.iitm.ac.in")
+AIPIPE_TOKEN = os.getenv("AIPIPE_TOKEN", "eyJhbGciOiJIUzI1NiJ9.eyJlbWFpbCI6IjIzZjEwMDE2MzBAZHMuc3R1ZHkuaWl0bS5hYy5pbiJ9.Lb3IoP9X54cAs1BaoBlzqx4l0C47XdjHdeNmlGOqc34")
+AIPIPE_URL = os.getenv("AIPIPE_URL", "https://aipipe.org/openai/v1/responses")
+
+# Thread pool for running sync browser operations
+executor = ThreadPoolExecutor(max_workers=3)
+
+class QuizRequest(BaseModel):
+    email: str
+    secret: str
+    url: str
+
+class QuizResponse(BaseModel):
+    status: str
+    message: Optional[str] = None
+
+def create_driver():
+    """Create a headless Chrome driver"""
+    chrome_options = Options()
+    chrome_options.add_argument("--headless")
+    chrome_options.add_argument("--no-sandbox")
+    chrome_options.add_argument("--disable-dev-shm-usage")
+    chrome_options.add_argument("--disable-gpu")
+    chrome_options.add_argument("--window-size=1920,1080")
+    
+    driver = webdriver.Chrome(options=chrome_options)
+    return driver
+
+def extract_text_from_pdf(pdf_content: bytes) -> Dict[str, str]:
+    """Extract text from PDF bytes, organized by page"""
+    try:
+        pdf_file = io.BytesIO(pdf_content)
+        pdf_reader = PyPDF2.PdfReader(pdf_file)
+        
+        pages = {}
+        for page_num, page in enumerate(pdf_reader.pages, 1):
+            text = page.extract_text()
+            pages[f"page_{page_num}"] = text
+        
+        return pages
+    except Exception as e:
+        print(f"Error extracting PDF: {e}")
+        return {}
+
+def ask_ai(question: str, data: Any, data_type: str = "text") -> Any:
+    """Use AIPIPE AI to analyze data and answer questions"""
+    if not AIPIPE_TOKEN:
+        print("AIPIPE API not configured, falling back to basic analysis")
+        return fallback_analysis(question, data)
+    
+    try:
+        # Prepare the data context
+        if data_type == "dataframe":
+            data_summary = f"""
+DataFrame with {len(data)} rows and {len(data.columns)} columns.
+Columns: {', '.join(data.columns)}
+First 10 rows:
+{data.head(10).to_string()}
+
+Summary statistics:
+{data.describe().to_string()}
+
+All data (if small enough):
+{data.to_string() if len(data) <= 100 else "Dataset too large, showing summary only"}
+"""
+        elif data_type == "pdf_pages":
+            data_summary = "\n\n".join([f"=== {page} ===\n{text}" for page, text in data.items()])
+        else:
+            data_summary = str(data)[:10000]  # Limit context size
+        
+        # Ask AI to analyze
+        prompt = f"""You are helping solve a data analysis quiz. You must provide ONLY the answer value, nothing else.
+
+Question/Task:
+{question}
+
+Available Data:
+{data_summary}
+
+IMPORTANT INSTRUCTIONS:
+- Provide ONLY the final answer value
+- NO explanations, NO reasoning, NO additional text
+- If it's a number, provide just the number (e.g., 12345)
+- If it's a string, provide just the string (e.g., "New York")
+- If it's a boolean, provide just true or false
+- If multiple values are needed, provide as a JSON object (e.g., {{"sum": 100, "count": 5}})
+- Be precise and accurate with calculations
+
+Answer:"""
+
+        headers = {
+            "Authorization": f"Bearer {AIPIPE_TOKEN}",
+            "Content-Type": "application/json"
+        }
+        
+        payload = {
+            "model": "gpt-4.1-nano",  # or another available model
+            "input": f"You are a data analysis assistant. Provide only the answer value, no explanations. prompt: {prompt}"
+        }
+        
+        print(f"Calling AIPIPE API...")
+        response = requests.post(AIPIPE_URL, headers=headers, json=payload, timeout=60)
+        response.raise_for_status()
+        
+        result = response.json()
+        answer_text = result.get("output", [{}])[0].get("content", [{}])[0].get("text", "")
+        print(f"AI answer: {answer_text}")
+        
+        # Clean up the answer
+        answer_text = answer_text = answer_text.strip()
+        
+
+        return answer_text
+        
+    except Exception as e:
+        print(f"Error asking AI: {e}")
+        import traceback
+        traceback.print_exc()
+        return fallback_analysis(question, data)
+
+def fallback_analysis(question: str, data: Any) -> Any:
+    """Fallback analysis without AI"""
+    question_lower = question.lower()
+    
+    # If data is a DataFrame
+    if isinstance(data, pd.DataFrame):
+        print(f"DataFrame shape: {data.shape}")
+        print(f"Columns: {data.columns.tolist()}")
+        
+        # Sum of a column
+        if 'sum' in question_lower:
+            for col in data.columns:
+                if col.lower() in question_lower or 'value' in col.lower():
+                    try:
+                        return int(data[col].sum())
+                    except:
+                        pass
+            numeric_cols = data.select_dtypes(include=['number']).columns
+            if len(numeric_cols) > 0:
+                return int(data[numeric_cols[0]].sum())
+        
+        # Count rows
+        if 'count' in question_lower or 'how many' in question_lower:
+            return len(data)
+        
+        # Average
+        if 'average' in question_lower or 'mean' in question_lower:
+            numeric_cols = data.select_dtypes(include=['number']).columns
+            if len(numeric_cols) > 0:
+                return float(data[numeric_cols[0]].mean())
+        
+        # Maximum
+        if 'max' in question_lower or 'highest' in question_lower:
+            numeric_cols = data.select_dtypes(include=['number']).columns
+            if len(numeric_cols) > 0:
+                return int(data[numeric_cols[0]].max())
+        
+        # Minimum
+        if 'min' in question_lower or 'lowest' in question_lower:
+            numeric_cols = data.select_dtypes(include=['number']).columns
+            if len(numeric_cols) > 0:
+                return int(data[numeric_cols[0]].min())
+    
+    # If data is text or dict
+    if isinstance(data, (str, dict)):
+        data_str = str(data)
+        numbers = [float(x) for x in re.findall(r'-?\d+\.?\d*', data_str)]
+        if numbers:
+            if 'sum' in question_lower:
+                return int(sum(numbers))
+            if 'count' in question_lower:
+                return len(numbers)
+            if 'average' in question_lower:
+                return sum(numbers) / len(numbers)
+    
+    return 0
+
+def download_and_process_file(file_url: str, question: str) -> Any:
+    """Download and process file with AI assistance"""
+    print(f"Downloading file: {file_url}")
+    
+    response = requests.get(file_url, timeout=30)
+    response.raise_for_status()
+    
+    content_type = response.headers.get('content-type', '')
+    
+    # Handle PDF
+    if 'pdf' in content_type.lower() or file_url.endswith('.pdf'):
+        pages = extract_text_from_pdf(response.content)
+        print(f"Extracted PDF with {len(pages)} pages")
+        return ask_ai(question, pages, "pdf_pages")
+    
+    # Handle CSV
+    if 'csv' in content_type.lower() or file_url.endswith('.csv'):
+        df = pd.read_csv(io.StringIO(response.text))
+        print(f"Loaded CSV with {len(df)} rows, {len(df.columns)} columns")
+        return ask_ai(question, df, "dataframe")
+    
+    # Handle Excel
+    if 'excel' in content_type.lower() or 'spreadsheet' in content_type.lower() or file_url.endswith(('.xlsx', '.xls')):
+        df = pd.read_excel(io.BytesIO(response.content))
+        print(f"Loaded Excel with {len(df)} rows, {len(df.columns)} columns")
+        return ask_ai(question, df, "dataframe")
+    
+    # Handle JSON
+    if 'json' in content_type.lower() or file_url.endswith('.json'):
+        data = json.loads(response.text)
+        if isinstance(data, list) and len(data) > 0 and isinstance(data[0], dict):
+            df = pd.DataFrame(data)
+            return ask_ai(question, df, "dataframe")
+        return ask_ai(question, data, "json")
+    
+    # Default: treat as text
+    return ask_ai(question, response.text, "text")
+
+def solve_quiz(quiz_url: str) -> Dict[str, Any]:
+    """Solve a single quiz using AI"""
+    driver = None
+    try:
+        print(f"Solving quiz: {quiz_url}")
+        driver = create_driver()
+        driver.get(quiz_url)
+        
+        # Wait for page to load and JavaScript to execute
+        time.sleep(3)
+        
+        # Get page content
+        page_text = driver.find_element(By.TAG_NAME, "body").text
+        print(f"Page content (first 500 chars): {page_text[:500]}")
+        
+        # Extract submit URL
+        submit_url_match = re.search(r'https?://[^\s]+/submit', page_text)
+        if not submit_url_match:
+            raise Exception("Could not find submit URL in page")
+        
+        submit_url = submit_url_match.group(0)
+        print(f"Submit URL: {submit_url}")
+        
+        # Find file links
+        file_links = driver.find_elements(By.CSS_SELECTOR, "a[href]")
+        file_url = None
+        
+        for link in file_links:
+            href = link.get_attribute('href')
+            text = link.text.lower()
+            if href and (re.search(r'\.(pdf|csv|xlsx?|json|txt)$', href, re.I) or 
+                        'file' in text or 'download' in text):
+                file_url = href
+                break
+        
+        # Solve the question with AI
+        answer = None
+        
+        if file_url:
+            print(f"Found file URL: {file_url}")
+            answer = download_and_process_file(file_url, page_text)
+        else:
+            # Try to extract API endpoint
+            api_match = re.search(r'https?://[^\s]+/api[^\s]*', page_text)
+            if api_match:
+                api_url = api_match.group(0)
+                print(f"Found API URL: {api_url}")
+                api_response = requests.get(api_url, timeout=30)
+                api_data = api_response.json() if 'json' in api_response.headers.get('content-type', '') else api_response.text
+                answer = ask_ai(page_text, api_data, "json" if isinstance(api_data, (dict, list)) else "text")
+            else:
+                # Use AI to understand the question from page content
+                answer = ask_ai(page_text, page_text, "text")
+        
+        print(f"Calculated answer: {answer}")
+        
+        return {
+            "answer": answer,
+            "submit_url": submit_url
+        }
+        
+    finally:
+        if driver:
+            driver.quit()
+
+def submit_answer(submit_url: str, quiz_url: str, answer: Any) -> Dict[str, Any]:
+    """Submit answer to the quiz endpoint"""
+    payload = {
+        "email": MY_EMAIL,
+        "secret": MY_SECRET,
+        "url": quiz_url,
+        "answer": answer
+    }
+    
+    print(f"Submitting to {submit_url}: {payload}")
+    
+    response = requests.post(submit_url, json=payload, timeout=30)
+    response.raise_for_status()
+    
+    return response.json()
+
+def process_quiz_chain(initial_url: str):
+    """Process a chain of quizzes"""
+    current_url = initial_url
+    max_quizzes = 10
+    quiz_count = 0
+    start_time = time.time()
+    
+    while current_url and quiz_count < max_quizzes:
+        quiz_count += 1
+        elapsed = time.time() - start_time
+        print(f"\n=== Quiz {quiz_count}: {current_url} ===")
+        print(f"Elapsed time: {elapsed:.1f}s")
+        
+        # Check 3-minute timeout
+        if elapsed > 170:  # 170 seconds = 2min 50sec, leave buffer
+            print("⚠️ Approaching 3-minute timeout, stopping")
+            break
+        
+        try:
+            # Solve the quiz
+            result = solve_quiz(current_url)
+            
+            # Submit the answer
+            submit_response = submit_answer(
+                result["submit_url"],
+                current_url,
+                result["answer"]
+            )
+            
+            print(f"Submit response: {submit_response}")
+            
+            # Check if correct and get next URL
+            if submit_response.get("correct"):
+                print("✓ Answer correct!")
+                current_url = submit_response.get("url")
+                if not current_url:
+                    print("🎉 Quiz chain completed successfully!")
+                    break
+            else:
+                reason = submit_response.get("reason", "Unknown error")
+                print(f"✗ Answer incorrect: {reason}")
+                # Try next URL if provided
+                next_url = submit_response.get("url")
+                if next_url and next_url != current_url:
+                    print(f"Moving to next quiz: {next_url}")
+                    current_url = next_url
+                else:
+                    print("No more quizzes to attempt")
+                    break
+                    
+        except Exception as e:
+            print(f"❌ Error in quiz {quiz_count}: {e}")
+            import traceback
+            traceback.print_exc()
+            break
+    
+    total_time = time.time() - start_time
+    print(f"\n{'='*50}")
+    print(f"Processed {quiz_count} quizzes in {total_time:.1f} seconds")
+    print(f"{'='*50}")
+
+@app.post("/quiz")
+async def handle_quiz(request: QuizRequest):
+    """Main endpoint to receive quiz requests"""
+    
+    # Validate secret
+    if request.secret != MY_SECRET:
+        raise HTTPException(status_code=403, detail="Invalid secret")
+    
+    # Process quiz in background
+    loop = asyncio.get_event_loop()
+    loop.run_in_executor(executor, process_quiz_chain, request.url)
+    
+    return JSONResponse(
+        status_code=200,
+        content={
+            "status": "accepted",
+            "message": "Quiz processing started"
+        }
+    )
+
+@app.get("/")
+async def root():
+    return {
+        "message": "Quiz API Endpoint with AIPIPE AI", 
+        "status": "running",
+        "ai_enabled": bool(AIPIPE_TOKEN)
+    }
+
+@app.get("/health")
+async def health():
+    return {
+        "status": "healthy",
+        "ai_enabled": bool(AIPIPE_TOKEN)
+    }
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8000)
