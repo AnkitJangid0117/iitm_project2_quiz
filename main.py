@@ -1,12 +1,14 @@
-# main.py - Enhanced with AIPIPE AI
+# main.py - Enhanced with AIPIPE AI and Fixed ChromeDriver
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from selenium import webdriver
 from selenium.webdriver.chrome.options import Options
+from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
+from webdriver_manager.chrome import ChromeDriverManager
 import requests
 import pandas as pd
 import PyPDF2
@@ -40,16 +42,42 @@ class QuizResponse(BaseModel):
     message: Optional[str] = None
 
 def create_driver():
-    """Create a headless Chrome driver"""
+    """Create a headless Chrome driver with proper configuration"""
     chrome_options = Options()
-    chrome_options.add_argument("--headless")
+    
+    # Essential headless arguments
+    chrome_options.add_argument("--headless=new")
     chrome_options.add_argument("--no-sandbox")
     chrome_options.add_argument("--disable-dev-shm-usage")
     chrome_options.add_argument("--disable-gpu")
+    chrome_options.add_argument("--disable-software-rasterizer")
+    chrome_options.add_argument("--disable-extensions")
+    chrome_options.add_argument("--disable-setuid-sandbox")
     chrome_options.add_argument("--window-size=1920,1080")
+    chrome_options.add_argument("--user-agent=Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
     
-    driver = webdriver.Chrome(options=chrome_options)
-    return driver
+    # Set Chrome binary location
+    chrome_options.binary_location = "/usr/bin/google-chrome"
+    
+    try:
+        # Use webdriver-manager to handle ChromeDriver
+        print("Initializing ChromeDriver with webdriver-manager...")
+        service = Service(ChromeDriverManager().install())
+        driver = webdriver.Chrome(service=service, options=chrome_options)
+        print("✓ ChromeDriver initialized successfully")
+        return driver
+    except Exception as e:
+        print(f"webdriver-manager failed: {e}")
+        print("Trying fallback method...")
+        
+        # Fallback: try direct Chrome invocation
+        try:
+            driver = webdriver.Chrome(options=chrome_options)
+            print("✓ ChromeDriver initialized with fallback method")
+            return driver
+        except Exception as e2:
+            print(f"All methods failed: {e2}")
+            raise Exception(f"Could not initialize ChromeDriver: {e2}")
 
 def extract_text_from_pdf(pdf_content: bytes) -> Dict[str, str]:
     """Extract text from PDF bytes, organized by page"""
@@ -94,7 +122,7 @@ All data (if small enough):
             data_summary = str(data)[:10000]  # Limit context size
         
         # Ask AI to analyze
-        prompt = f"""You are helping solve a data analysis quiz. You must provide ONLY the answer value, nothing else.
+        prompt = f"""You are helping solve a data analysis quiz. You must provide ONLY the answer value in the correct format.
 
 Question/Task:
 {question}
@@ -102,14 +130,17 @@ Question/Task:
 Available Data:
 {data_summary}
 
-IMPORTANT INSTRUCTIONS:
-- Provide ONLY the final answer value
-- NO explanations, NO reasoning, NO additional text
-- If it's a number, provide just the number (e.g., 12345)
-- If it's a string, provide just the string (e.g., "New York")
-- If it's a boolean, provide just true or false
-- If multiple values are needed, provide as a JSON object (e.g., {{"sum": 100, "count": 5}})
-- Be precise and accurate with calculations
+CRITICAL INSTRUCTIONS - ANSWER FORMAT:
+- Provide ONLY the final answer value, absolutely NO explanations or reasoning
+- Answer must be ONE of these types:
+  * A NUMBER (integer or float): e.g., 12345 or 123.45
+  * A BOOLEAN: true or false
+  * A STRING: e.g., New York (without quotes)
+  * A BASE64 URI: e.g., data:image/png;base64,iVBORw0KG...
+- DO NOT return JSON objects or arrays
+- If the question asks for multiple values, return just the primary answer
+- For calculations, return ONLY the final number
+- Do not include units, currency symbols, or explanations
 
 Answer:"""
 
@@ -119,8 +150,8 @@ Answer:"""
         }
         
         payload = {
-            "model": "gpt-4.1-nano",  # or another available model
-            "input": f"You are a data analysis assistant. Provide only the answer value, no explanations. prompt: {prompt}"
+            "model": "gpt-4o-mini",
+            "input": prompt
         }
         
         print(f"Calling AIPIPE API...")
@@ -128,13 +159,40 @@ Answer:"""
         response.raise_for_status()
         
         result = response.json()
-        answer_text = result.get("output", [{}])[0].get("content", [{}])[0].get("text", "")
+        
+        # Parse AIPIPE response format
+        try:
+            answer_text = result.get("output", [{}])[0].get("content", [{}])[0].get("text", "")
+        except (KeyError, IndexError, TypeError):
+            # Fallback to OpenAI format
+            answer_text = result.get('choices', [{}])[0].get('message', {}).get('content', '')
+        
+        answer_text = answer_text.strip()
         print(f"AI answer: {answer_text}")
         
-        # Clean up the answer
-        answer_text = answer_text = answer_text.strip()
+        # Clean up markdown/code blocks
+        answer_text = re.sub(r'^```json\s*|\s*```$', '', answer_text, flags=re.MULTILINE)
+        answer_text = answer_text.strip('`').strip('"').strip("'").strip()
         
-
+        # Try to parse as number first (most common for data analysis)
+        try:
+            # Check if it looks like a number
+            if re.match(r'^-?\d+\.?\d*$', answer_text):
+                if '.' in answer_text:
+                    return float(answer_text)
+                return int(answer_text)
+        except:
+            pass
+        
+        # Check for boolean
+        if answer_text.lower() in ['true', 'false']:
+            return answer_text.lower() == 'true'
+        
+        # Check if it's a base64 string (for file attachments)
+        if re.match(r'^data:[^;]+;base64,[A-Za-z0-9+/]+=*$', answer_text):
+            return answer_text
+        
+        # Return as string (don't return JSON objects)
         return answer_text
         
     except Exception as e:
