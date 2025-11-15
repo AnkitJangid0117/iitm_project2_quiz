@@ -1,14 +1,8 @@
-# main.py - Enhanced with AIPIPE AI and Fixed ChromeDriver
+# main.py - Enhanced with AIPIPE AI and Playwright
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
-from selenium import webdriver
-from selenium.webdriver.chrome.options import Options
-from selenium.webdriver.chrome.service import Service
-from selenium.webdriver.common.by import By
-from selenium.webdriver.support.ui import WebDriverWait
-from selenium.webdriver.support import expected_conditions as EC
-from webdriver_manager.chrome import ChromeDriverManager
+from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeout
 import requests
 import pandas as pd
 import PyPDF2
@@ -40,44 +34,6 @@ class QuizRequest(BaseModel):
 class QuizResponse(BaseModel):
     status: str
     message: Optional[str] = None
-
-def create_driver():
-    """Create a headless Chrome driver with proper configuration"""
-    chrome_options = Options()
-    
-    # Essential headless arguments
-    chrome_options.add_argument("--headless=new")
-    chrome_options.add_argument("--no-sandbox")
-    chrome_options.add_argument("--disable-dev-shm-usage")
-    chrome_options.add_argument("--disable-gpu")
-    chrome_options.add_argument("--disable-software-rasterizer")
-    chrome_options.add_argument("--disable-extensions")
-    chrome_options.add_argument("--disable-setuid-sandbox")
-    chrome_options.add_argument("--window-size=1920,1080")
-    chrome_options.add_argument("--user-agent=Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
-    
-    # Set Chrome binary location
-    chrome_options.binary_location = "/usr/bin/google-chrome"
-    
-    try:
-        # Use webdriver-manager to handle ChromeDriver
-        print("Initializing ChromeDriver with webdriver-manager...")
-        service = Service(ChromeDriverManager().install())
-        driver = webdriver.Chrome(service=service, options=chrome_options)
-        print("✓ ChromeDriver initialized successfully")
-        return driver
-    except Exception as e:
-        print(f"webdriver-manager failed: {e}")
-        print("Trying fallback method...")
-        
-        # Fallback: try direct Chrome invocation
-        try:
-            driver = webdriver.Chrome(options=chrome_options)
-            print("✓ ChromeDriver initialized with fallback method")
-            return driver
-        except Exception as e2:
-            print(f"All methods failed: {e2}")
-            raise Exception(f"Could not initialize ChromeDriver: {e2}")
 
 def extract_text_from_pdf(pdf_content: bytes) -> Dict[str, str]:
     """Extract text from PDF bytes, organized by page"""
@@ -297,69 +253,80 @@ def download_and_process_file(file_url: str, question: str) -> Any:
     return ask_ai(question, response.text, "text")
 
 def solve_quiz(quiz_url: str) -> Dict[str, Any]:
-    """Solve a single quiz using AI"""
-    driver = None
-    try:
-        print(f"Solving quiz: {quiz_url}")
-        driver = create_driver()
-        driver.get(quiz_url)
+    """Solve a single quiz using Playwright"""
+    print(f"Solving quiz: {quiz_url}")
+    
+    with sync_playwright() as p:
+        # Launch browser
+        browser = p.chromium.launch(
+            headless=True,
+            args=[
+                '--no-sandbox',
+                '--disable-setuid-sandbox',
+                '--disable-dev-shm-usage',
+                '--disable-gpu'
+            ]
+        )
         
-        # Wait for page to load and JavaScript to execute
-        time.sleep(3)
-        
-        # Get page content
-        page_text = driver.find_element(By.TAG_NAME, "body").text
-        print(f"Page content (first 500 chars): {page_text[:500]}")
-        
-        # Extract submit URL
-        submit_url_match = re.search(r'https?://[^\s]+/submit', page_text)
-        if not submit_url_match:
-            raise Exception("Could not find submit URL in page")
-        
-        submit_url = submit_url_match.group(0)
-        print(f"Submit URL: {submit_url}")
-        
-        # Find file links
-        file_links = driver.find_elements(By.CSS_SELECTOR, "a[href]")
-        file_url = None
-        
-        for link in file_links:
-            href = link.get_attribute('href')
-            text = link.text.lower()
-            if href and (re.search(r'\.(pdf|csv|xlsx?|json|txt)$', href, re.I) or 
-                        'file' in text or 'download' in text):
-                file_url = href
-                break
-        
-        # Solve the question with AI
-        answer = None
-        
-        if file_url:
-            print(f"Found file URL: {file_url}")
-            answer = download_and_process_file(file_url, page_text)
-        else:
-            # Try to extract API endpoint
-            api_match = re.search(r'https?://[^\s]+/api[^\s]*', page_text)
-            if api_match:
-                api_url = api_match.group(0)
-                print(f"Found API URL: {api_url}")
-                api_response = requests.get(api_url, timeout=30)
-                api_data = api_response.json() if 'json' in api_response.headers.get('content-type', '') else api_response.text
-                answer = ask_ai(page_text, api_data, "json" if isinstance(api_data, (dict, list)) else "text")
+        try:
+            page = browser.new_page()
+            page.goto(quiz_url, wait_until='networkidle', timeout=30000)
+            
+            # Wait a bit for JS to execute
+            time.sleep(2)
+            
+            # Get page content
+            page_text = page.inner_text('body')
+            print(f"Page content (first 500 chars): {page_text[:500]}")
+            
+            # Extract submit URL
+            submit_url_match = re.search(r'https?://[^\s]+/submit', page_text)
+            if not submit_url_match:
+                raise Exception("Could not find submit URL in page")
+            
+            submit_url = submit_url_match.group(0)
+            print(f"Submit URL: {submit_url}")
+            
+            # Find file links
+            file_url = None
+            links = page.query_selector_all('a[href]')
+            
+            for link in links:
+                href = link.get_attribute('href')
+                text = link.inner_text().lower()
+                if href and (re.search(r'\.(pdf|csv|xlsx?|json|txt)$', href, re.I) or 
+                            'file' in text or 'download' in text):
+                    file_url = href
+                    break
+            
+            # Solve the question with AI
+            answer = None
+            
+            if file_url:
+                print(f"Found file URL: {file_url}")
+                answer = download_and_process_file(file_url, page_text)
             else:
-                # Use AI to understand the question from page content
-                answer = ask_ai(page_text, page_text, "text")
-        
-        print(f"Calculated answer: {answer}")
-        
-        return {
-            "answer": answer,
-            "submit_url": submit_url
-        }
-        
-    finally:
-        if driver:
-            driver.quit()
+                # Try to extract API endpoint
+                api_match = re.search(r'https?://[^\s]+/api[^\s]*', page_text)
+                if api_match:
+                    api_url = api_match.group(0)
+                    print(f"Found API URL: {api_url}")
+                    api_response = requests.get(api_url, timeout=30)
+                    api_data = api_response.json() if 'json' in api_response.headers.get('content-type', '') else api_response.text
+                    answer = ask_ai(page_text, api_data, "json" if isinstance(api_data, (dict, list)) else "text")
+                else:
+                    # Use AI to understand the question from page content
+                    answer = ask_ai(page_text, page_text, "text")
+            
+            print(f"Calculated answer: {answer}")
+            
+            return {
+                "answer": answer,
+                "submit_url": submit_url
+            }
+            
+        finally:
+            browser.close()
 
 def submit_answer(submit_url: str, quiz_url: str, answer: Any) -> Dict[str, Any]:
     """Submit answer to the quiz endpoint"""
@@ -461,7 +428,7 @@ async def handle_quiz(request: QuizRequest):
 @app.get("/")
 async def root():
     return {
-        "message": "Quiz API Endpoint with AIPIPE AI", 
+        "message": "Quiz API Endpoint with AIPIPE AI (Playwright)", 
         "status": "running",
         "ai_enabled": bool(AIPIPE_TOKEN)
     }
