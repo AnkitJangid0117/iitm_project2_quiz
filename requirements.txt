@@ -1,0 +1,6 @@
+fastapi
+mangum
+httpx
+bs4
+python-dotenv
+pydantic
