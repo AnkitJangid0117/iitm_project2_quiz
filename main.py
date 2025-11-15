@@ -28,6 +28,8 @@ from urllib.parse import urljoin
 app = FastAPI()
 
 # Configuration
+
+
 MY_SECRET = os.getenv("QUIZ_SECRET", "")
 MY_EMAIL = os.getenv("QUIZ_EMAIL", "")
 AIPIPE_TOKEN = os.getenv("AIPIPE_TOKEN", "")
